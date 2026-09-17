@@ -4,12 +4,10 @@ import logging
 import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
+from homeassistant.core import callback
 from homeassistant.components.media_player import (
-    MediaPlayerEntity, PLATFORM_SCHEMA, DEVICE_CLASS_RECEIVER)
-from homeassistant.components.media_player.const import (
-    SUPPORT_VOLUME_SET,
-    SUPPORT_VOLUME_MUTE, SUPPORT_TURN_ON, SUPPORT_TURN_OFF,
-    SUPPORT_VOLUME_STEP, SUPPORT_SELECT_SOURCE)
+    MediaPlayerEntity, PLATFORM_SCHEMA, MediaPlayerDeviceClass,
+    MediaPlayerEntityFeature)
 from homeassistant.const import (
     CONF_NAME, STATE_OFF, STATE_ON, STATE_UNKNOWN, STATE_UNAVAILABLE,
     EVENT_HOMEASSISTANT_START, EVENT_HOMEASSISTANT_STOP)
@@ -28,12 +26,12 @@ DEFAULT_MAX_VOLUME = -10
 DEFAULT_VOLUME_STEP = 4
 
 SUPPORT_NAD = (
-    SUPPORT_VOLUME_SET 
-    | SUPPORT_VOLUME_MUTE 
-    | SUPPORT_TURN_ON 
-    | SUPPORT_TURN_OFF 
-    | SUPPORT_VOLUME_STEP 
-    | SUPPORT_SELECT_SOURCE
+    MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.TURN_ON
+    | MediaPlayerEntityFeature.TURN_OFF
+    | MediaPlayerEntityFeature.VOLUME_STEP
+    | MediaPlayerEntityFeature.SELECT_SOURCE
 )
 
 CONF_MIN_VOLUME = 'min_volume'
@@ -111,17 +109,17 @@ class NADEntity(MediaPlayerEntity):
     def name(self):
         """Return the name of the entity."""
         return self._name
-    
+
     @property
     def device_class(self):
         """Return the class of this device."""
-        return DEVICE_CLASS_RECEIVER
+        return MediaPlayerDeviceClass.RECEIVER
 
     @property
     def state(self):
         """Return the state of the entity."""
         return self._state
-    
+
     @property
     def icon(self):
         """Return the icon for the device."""
@@ -136,7 +134,7 @@ class NADEntity(MediaPlayerEntity):
     def source_list(self):
         """List of available input sources."""
         return self._client.available_sources()
-    
+
     @property
     def available(self):
         """Return if device is available."""
@@ -189,12 +187,13 @@ class NADEntity(MediaPlayerEntity):
         await self._client.select_source(source)
 
     async def async_added_to_hass(self):
-        from nadtcp import NADReceiverTCPC338, \
+        from .nadtcp_client import NADReceiverTCPC338, \
             CMD_POWER, CMD_VOLUME, CMD_MUTE, CMD_SOURCE
 
         def state_changed_cb(state):
             dispatcher_send(self.hass, SIGNAL_NAD_STATE_RECEIVED, state)
 
+        @callback
         def handle_state_changed(state):
             if CMD_POWER in state:
                 self._state = STATE_ON if state[CMD_POWER] else STATE_OFF

@@ -1,10 +1,11 @@
 {
   "domain": "nadtcp2",
   "name": "NAD C338 integration",
-  "documentation": "https://github.com/mindigmarton/ha-nadtcp",
-  "requirements": [
-    "nadtcp==0.2.0.dev2"
-  ],
+  "documentation": "https://github.com/mschneider-git/ha-nadtcp",
+  "issue_tracker": "https://github.com/mschneider-git/ha-nadtcp/issues",
+  "requirements": [],
   "dependencies": [],
-  "codeowners": ["@mindigmarton"]
+  "codeowners": ["@mschneider-git"],
+  "version": "0.2.0",
+  "iot_class": "local_push"
 }
