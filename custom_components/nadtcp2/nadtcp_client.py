@@ -4,7 +4,13 @@ The original package calls asyncio.wait_for()/asyncio.sleep() with a `loop=`
 keyword argument, which was removed in Python 3.10. That made connect() raise
 a TypeError immediately, so the entity never received any state and stayed
 'unavailable'. This vendored copy drops the removed keyword arguments and
-fixes an `is`-vs-`==` string comparison; no protocol behavior is changed.
+fixes an `is`-vs-`==` string comparison.
+
+It also protects the amplifier's connection slots: the C338 firmware does not
+free the slots of closed connections, so a burst of reconnects locks it up
+until it is power-cycled. Unparseable lines are skipped instead of dropping
+the connection, and every reconnect waits, backing off when connections keep
+dying quickly.
 """
 import asyncio
 import socket
@@ -54,7 +60,8 @@ C338_CMDS = {
          },
     'Main.Volume':
         {'supported_operators': ['+', '-', '=', '?'],
-         'values': range(-80, 0),
+         'min': -80,
+         'max': 0,
          'type': float
          },
     'Main.Bass':
@@ -84,7 +91,7 @@ C338_CMDS = {
          },
     'Main.Version':
         {'supported_operators': ['?'],
-         'type': float
+         'type': str
          },
     'Main.Model':
         {'supported_operators': ['?'],
@@ -97,6 +104,11 @@ class NADReceiverTCPC338(asyncio.Protocol):
     PORT = 30001
 
     CMD_MIN_INTERVAL = 0.15
+
+    # A connection that dies sooner than this counts as unstable, and the
+    # pause before the next reconnect doubles, up to MAX_RECONNECT_INTERVAL.
+    STABLE_CONNECTION_TIME = 60
+    MAX_RECONNECT_INTERVAL = 300
 
     def __init__(self, host, loop, state_changed_cb=None,
                  reconnect_interval=15, connect_timeout=10):
@@ -113,6 +125,10 @@ class NADReceiverTCPC338(asyncio.Protocol):
         self._closing = False
         self._state = {}
 
+        self._connect_task = None
+        self._connected_at = None
+        self._reconnect_delay = reconnect_interval
+
     @staticmethod
     def make_command(command, operator, value=None):
         cmd_desc = C338_CMDS[command]
@@ -128,7 +144,11 @@ class NADReceiverTCPC338(asyncio.Protocol):
                 cmd = command + operator
             else:
                 # validate value
-                if 'values' in cmd_desc:
+                if 'min' in cmd_desc:
+                    if not cmd_desc['min'] <= value <= cmd_desc['max']:
+                        raise ValueError("Given value \'%s\' is not within %s..%s"
+                                         % (value, cmd_desc['min'], cmd_desc['max']))
+                elif 'values' in cmd_desc:
                     if 'type' in cmd_desc and cmd_desc['type'] == bool:
                         value = cmd_desc['values'][int(value)]
                     elif value not in cmd_desc['values']:
@@ -143,7 +163,7 @@ class NADReceiverTCPC338(asyncio.Protocol):
 
     @staticmethod
     def parse_part(response):
-        key, value = response.split('=')
+        key, value = response.split('=', 1)
 
         cmd_desc = C338_CMDS[key]
 
@@ -159,9 +179,11 @@ class NADReceiverTCPC338(asyncio.Protocol):
     def connection_made(self, transport):
         self._transport = transport
 
+        self._connected_at = time.monotonic()
+
         sock = self._transport.get_extra_info('socket')
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 1)
+        sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPIDLE, 30)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPINTVL, 10)
         sock.setsockopt(socket.SOL_TCP, socket.TCP_KEEPCNT, 3)
 
@@ -174,9 +196,20 @@ class NADReceiverTCPC338(asyncio.Protocol):
         self._buffer += data
 
         new_state = {}
-        while '\r\n' in self._buffer:
-            line, self._buffer = self._buffer.split('\r\n', 1)
-            key, value = self.parse_part(line)
+        while True:
+            ends = [i for i in (self._buffer.find('\r'), self._buffer.find('\n')) if i >= 0]
+            if not ends:
+                break
+            line, self._buffer = self._buffer[:min(ends)], self._buffer[min(ends) + 1:]
+            if not line:
+                continue
+            # An exception here would make asyncio drop the connection, and
+            # the reconnect would hit the same line again: skip it instead.
+            try:
+                key, value = self.parse_part(line)
+            except (KeyError, ValueError, IndexError):
+                _LOGGER.debug("Ignoring unrecognized line from %s: %r", self._host, line)
+                continue
             new_state[key] = value
 
             # volume changes implicitly disables mute,
@@ -201,12 +234,32 @@ class NADReceiverTCPC338(asyncio.Protocol):
         if self._state_changed_cb:
             self._state_changed_cb(self._state)
 
-        if not self._closing:
-            self._loop.create_task(self.connect())
+        if self._closing:
+            return
+        uptime = time.monotonic() - (self._connected_at or 0)
+        if uptime >= self.STABLE_CONNECTION_TIME:
+            self._reconnect_delay = self._reconnect_interval
+        delay = self._reconnect_delay
+        # The next drop within STABLE_CONNECTION_TIME waits twice as long.
+        self._reconnect_delay = min(delay * 2, self.MAX_RECONNECT_INTERVAL)
+        _LOGGER.info("Reconnecting to %s in %ss", self._host, delay)
+        self.start(delay=delay)
+
+    def start(self, delay=0):
+        """Connect in the background (after `delay` seconds), retrying until connected."""
+        self._closing = False
+        if self._connect_task is None or self._connect_task.done():
+            self._connect_task = self._loop.create_task(self._connect_loop(delay))
 
     async def connect(self):
-        self._closing = False
+        """Connect, retrying until connected or disconnect() is called."""
+        self.start()
+        await asyncio.shield(self._connect_task)
 
+    async def _connect_loop(self, delay):
+        if delay:
+            await asyncio.sleep(delay)
+        failures = 0
         while not self._closing and not self._transport:
             try:
                 _LOGGER.debug("Connecting to %s", self._host)
@@ -214,15 +267,22 @@ class NADReceiverTCPC338(asyncio.Protocol):
                     lambda: self, self._host, NADReceiverTCPC338.PORT)
                 await asyncio.wait_for(
                     connection, timeout=self._connect_timeout)
+                if failures:
+                    _LOGGER.info("Connected to %s again", self._host)
                 return
-            except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
-                _LOGGER.exception("Error connecting to %s, reconnecting in %ss",
-                                  self._host, self._reconnect_interval,
-                                  exc_info=True)
+            except (ConnectionRefusedError, OSError, asyncio.TimeoutError) as err:
+                failures += 1
+                # Only the first failure of an outage is worth a warning.
+                log = _LOGGER.warning if failures == 1 else _LOGGER.debug
+                log("Error connecting to %s (%s), retrying every %ss",
+                    self._host, err or type(err).__name__, self._reconnect_interval)
                 await asyncio.sleep(self._reconnect_interval)
 
     async def disconnect(self):
         self._closing = True
+        self._state_changed_cb = None
+        if self._connect_task is not None and not self._connect_task.done():
+            self._connect_task.cancel()
         if self._transport:
             self._transport.close()
 
@@ -234,7 +294,8 @@ class NADReceiverTCPC338(asyncio.Protocol):
             if cmd_wait_time > 0:
                 await asyncio.sleep(cmd_wait_time)
             cmd = self.make_command(command, operator, value)
-            self._transport.write(cmd.encode('utf-8'))
+            # The NAD protocol terminates every command with a carriage return.
+            self._transport.write((cmd + '\r').encode('utf-8'))
 
             self._last_cmd_time = time.time()
 

@@ -12,12 +12,10 @@ from homeassistant.const import (
     CONF_NAME, STATE_OFF, STATE_ON, STATE_UNKNOWN, STATE_UNAVAILABLE,
     EVENT_HOMEASSISTANT_START, EVENT_HOMEASSISTANT_STOP)
 
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect, dispatcher_send)
+from .nadtcp_client import (
+    NADReceiverTCPC338, CMD_POWER, CMD_VOLUME, CMD_MUTE, CMD_SOURCE)
 
 _LOGGER = logging.getLogger(__name__)
-
-SIGNAL_NAD_STATE_RECEIVED = 'nad_state_received'
 
 DEFAULT_RECONNECT_INTERVAL = 10
 DEFAULT_NAME = 'NAD amplifier'
@@ -70,6 +68,8 @@ class NADEntity(MediaPlayerEntity):
     def __init__(self, name, host, reconnect_interval, min_volume, max_volume, volume_step):
         """Initialize the entity properties"""
         self._client = None
+        self._unsub_start = None
+        self._unsub_stop = None
         self._name = name
         self._host = host
         self._reconnect_interval = reconnect_interval
@@ -81,6 +81,8 @@ class NADEntity(MediaPlayerEntity):
         self._muted = None
         self._volume = None
         self._source = None
+
+        self._attr_unique_id = f"nadtcp2_{host}"
 
     def nad_vol_to_internal_vol(self, nad_vol):
         """Convert the configured volume range to internal volume range.
@@ -99,6 +101,19 @@ class NADEntity(MediaPlayerEntity):
 
     def internal_vol_to_nad_vol(self, internal_vol):
         return int(round(internal_vol * (self._max_vol - self._min_vol) + self._min_vol))
+
+    def _clamp(self, nad_vol):
+        """Keep a volume within the configured min/max range."""
+        return max(self._min_vol, min(self._max_vol, nad_vol))
+
+    async def _step_volume(self, direction):
+        if self._volume is None:
+            _LOGGER.debug("Volume is not known yet, ignoring volume step")
+            return
+        current = self.internal_vol_to_nad_vol(self._volume)
+        # volume_step counts half dB; move at least one whole dB per step.
+        delta = max(1, int(self._volume_step * 0.5 + 0.5))
+        await self._client.set_volume(self._clamp(current + direction * delta))
 
     @property
     def should_poll(self):
@@ -133,12 +148,14 @@ class NADEntity(MediaPlayerEntity):
     @property
     def source_list(self):
         """List of available input sources."""
+        if self._client is None:
+            return []
         return self._client.available_sources()
 
     @property
     def available(self):
         """Return if device is available."""
-        return self._state is not STATE_UNKNOWN
+        return self._state != STATE_UNKNOWN
 
     @property
     def volume_level(self):
@@ -165,15 +182,15 @@ class NADEntity(MediaPlayerEntity):
 
     async def async_volume_up(self):
         """Step volume up in the configured increments."""
-        await self._client.set_volume(self.internal_vol_to_nad_vol(self.volume_level) + self._volume_step * 0.5)
+        await self._step_volume(1)
 
     async def async_volume_down(self):
         """Step volume down in the configured increments."""
-        await self._client.set_volume(self.internal_vol_to_nad_vol(self.volume_level) - self._volume_step * 0.5)
+        await self._step_volume(-1)
 
     async def async_set_volume_level(self, volume):
         """Set volume level, range 0..1."""
-        await self._client.set_volume(self.internal_vol_to_nad_vol(volume))
+        await self._client.set_volume(self._clamp(self.internal_vol_to_nad_vol(volume)))
 
     async def async_mute_volume(self, mute):
         """Mute (true) or unmute (false) media player."""
@@ -186,43 +203,56 @@ class NADEntity(MediaPlayerEntity):
         """Select input source."""
         await self._client.select_source(source)
 
+    @callback
+    def _handle_state_changed(self, state):
+        """Apply a state update from the client (called in the event loop)."""
+        if CMD_POWER in state:
+            self._state = STATE_ON if state[CMD_POWER] else STATE_OFF
+        else:
+            self._state = STATE_UNKNOWN
+
+        if CMD_VOLUME in state:
+            self._volume = self.nad_vol_to_internal_vol(state[CMD_VOLUME])
+        if CMD_MUTE in state:
+            self._muted = state[CMD_MUTE]
+        if CMD_SOURCE in state:
+            self._source = state[CMD_SOURCE]
+
+        if self.hass is not None:
+            self.async_write_ha_state()
+
     async def async_added_to_hass(self):
-        from .nadtcp_client import NADReceiverTCPC338, \
-            CMD_POWER, CMD_VOLUME, CMD_MUTE, CMD_SOURCE
-
-        def state_changed_cb(state):
-            dispatcher_send(self.hass, SIGNAL_NAD_STATE_RECEIVED, state)
-
-        @callback
-        def handle_state_changed(state):
-            if CMD_POWER in state:
-                self._state = STATE_ON if state[CMD_POWER] else STATE_OFF
-            else:
-                self._state = STATE_UNKNOWN
-
-            if CMD_VOLUME in state:
-                self._volume = self.nad_vol_to_internal_vol(state[CMD_VOLUME])
-            if CMD_MUTE in state:
-                self._muted = state[CMD_MUTE]
-            if CMD_SOURCE in state:
-                self._source = state[CMD_SOURCE]
-
-            self.async_schedule_update_ha_state()
-
-        async def disconnect(event):
-            await self._client.disconnect()
-
-        async def connect(event):
-            await self._client.connect()
-            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, disconnect)
-
         self._client = NADReceiverTCPC338(self._host, self.hass.loop,
                                           reconnect_interval=self._reconnect_interval,
-                                          state_changed_cb=state_changed_cb)
+                                          state_changed_cb=self._handle_state_changed)
 
-        async_dispatcher_connect(self.hass, SIGNAL_NAD_STATE_RECEIVED, handle_state_changed)
+        async def on_stop(event):
+            self._unsub_stop = None
+            await self._client.disconnect()
+
+        # Registered right away, so the connection is closed on shutdown even
+        # if it was never established.
+        self._unsub_stop = self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
+
+        # Connect in the background: an unreachable amplifier must not block
+        # the platform setup.
+        @callback
+        def on_start(event):
+            self._unsub_start = None
+            self._client.start()
 
         if self.hass.is_running:
-            await connect(None)
+            self._client.start()
         else:
-            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, connect)
+            self._unsub_start = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_START, on_start)
+
+    async def async_will_remove_from_hass(self):
+        """Close the connection so a removed or reloaded entity frees its slot."""
+        # One-shot listeners that already fired must not be removed again.
+        for unsub in (self._unsub_start, self._unsub_stop):
+            if unsub is not None:
+                unsub()
+        self._unsub_start = self._unsub_stop = None
+        if self._client is not None:
+            await self._client.disconnect()
